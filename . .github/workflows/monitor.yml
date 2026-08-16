@@ -27,6 +27,6 @@ jobs:
 
       - name: Run VOX monitor
         env:
-          PUSHOVER_USER_KEY: ${{  urb4cb5vbzjavjg6op4b7hc7f2osny}}
-          PUSHOVER_APP_TOKEN: ${{ am83eptke7m3monnxvb2u3bfbowbga }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_APP_TOKEN: ${{ secrets.PUSHOVER_APP_TOKEN }}
         run: python monitor.py
