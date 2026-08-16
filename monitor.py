@@ -27,134 +27,56 @@ def notify(title, message, priority=0, url=None):
         data["url"] = url
         data["url_title"] = "Open VOX booking"
 
-    response = requests.post(
+    r = requests.post(
         "https://api.pushover.net/1/messages.json",
         data=data,
         timeout=30,
     )
-    response.raise_for_status()
+    r.raise_for_status()
 
 
 def parse_date_from_text(text):
-    match = re.search(
+    m = re.search(
         r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+([A-Za-z]{3})\b",
         text,
     )
 
-    if not match:
+    if not m:
         return None
-
-    day = int(match.group(1))
-    month = match.group(2)
-    year = datetime.now(TZ).year
 
     try:
         return datetime.strptime(
-            f"{day} {month} {year}",
+            f"{m.group(1)} {m.group(2)} {datetime.now(TZ).year}",
             "%d %b %Y",
         ).date()
     except ValueError:
         return None
 
 
-def text_has_any(text, phrases):
-    low = text.lower()
-    return any(phrase in low for phrase in phrases)
+def get_page(page, url):
+    """
+    Open VOX with settings that reduce HTTP/2/QUIC problems
+    on GitHub Actions.
+    """
 
+    page.set_default_timeout(15000)
 
-def inspect_booking_page(page, href):
-    try:
-        page.goto(
-            href,
-            wait_until="domcontentloaded",
-            timeout=45000,
-        )
-        page.wait_for_timeout(2500)
-
-    except Exception as error:
-        return (
-            "error",
-            f"Could not open booking page: {type(error).__name__}",
-        )
-
-    try:
-        body = page.locator("body").inner_text(timeout=10000)
-    except Exception:
-        return (
-            "error",
-            "Could not read booking page.",
-        )
-
-    unavailable = [
-        "sold out",
-        "soldout",
-        "house full",
-        "no seats available",
-        "no seats",
-        "unavailable",
-        "not available",
-        "session unavailable",
-    ]
-
-    if text_has_any(body, unavailable):
-        return (
-            "unavailable",
-            "VOX reports the session as unavailable/sold out.",
-        )
-
-    seat_select_markers = [
-        "select your seats",
-        "select seats",
-        "choose your seats",
-        "seat selection",
-        "available seats",
-        "screen",
-    ]
-
-    seat_dom = page.locator(
-        "[class*='seat'], "
-        "[id*='seat'], "
-        "[data-seat], "
-        "button[aria-label*='seat' i]"
-    ).count()
-
-    if text_has_any(body, seat_select_markers) and seat_dom > 0:
-        return (
-            "available",
-            "Seat-selection page loaded.",
-        )
-
-    login_markers = [
-        "sign in",
-        "log in",
-        "login",
-        "register",
-    ]
-
-    if text_has_any(body, login_markers):
-        return (
-            "needs_login",
-            "VOX appears to require login before seat selection.",
-        )
-
-    if seat_dom > 0:
-        return (
-            "available",
-            "Seat elements were detected.",
-        )
-
-    return (
-        "unknown",
-        "Booking page opened, but a seat map could not be confirmed.",
+    page.goto(
+        url,
+        wait_until="commit",
+        timeout=60000,
     )
+
+    page.wait_for_timeout(5000)
+
+    return page
 
 
 def collect_dates(page):
     result = []
 
-    links = page.locator("a").all()
+    for link in page.locator("a").all():
 
-    for link in links:
         try:
             text = link.inner_text().strip()
             current_date = parse_date_from_text(text)
@@ -174,6 +96,7 @@ def collect_dates(page):
     output = []
 
     for item in sorted(result):
+
         if item not in seen:
             seen.add(item)
             output.append(item)
@@ -181,43 +104,143 @@ def collect_dates(page):
     return output
 
 
+def inspect_booking_page(page, url):
+
+    try:
+
+        get_page(page, url)
+
+        body = page.locator("body").inner_text(
+            timeout=15000
+        )
+
+    except Exception as e:
+
+        return (
+            "error",
+            f"Booking page error: {type(e).__name__}: {e}",
+        )
+
+    low = body.lower()
+
+    unavailable_words = [
+        "sold out",
+        "soldout",
+        "house full",
+        "no seats available",
+        "no seats",
+        "unavailable",
+        "not available",
+        "session unavailable",
+    ]
+
+    for word in unavailable_words:
+
+        if word in low:
+
+            return (
+                "unavailable",
+                "VOX reports this session as unavailable.",
+            )
+
+    seat_words = [
+        "select your seats",
+        "select seats",
+        "choose your seats",
+        "seat selection",
+        "available seats",
+    ]
+
+    seat_dom = page.locator(
+        "[class*='seat'],"
+        "[id*='seat'],"
+        "[data-seat],"
+        "button[aria-label*='seat' i]"
+    ).count()
+
+    if any(word in low for word in seat_words) and seat_dom > 0:
+
+        return (
+            "available",
+            "Seat-selection page loaded.",
+        )
+
+    if seat_dom > 0:
+
+        return (
+            "available",
+            "Seat elements detected.",
+        )
+
+    login_words = [
+        "sign in",
+        "log in",
+        "login",
+        "register",
+    ]
+
+    if any(word in low for word in login_words):
+
+        return (
+            "needs_login",
+            "VOX requires login before seat selection.",
+        )
+
+    return (
+        "unknown",
+        "Booking page opened but availability could not be confirmed.",
+    )
+
+
 def scan():
-    now = datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+
+    now = datetime.now(TZ).strftime(
+        "%Y-%m-%d %H:%M"
+    )
 
     findings = []
     dates_seen = []
 
-    with sync_playwright() as playwright:
+    with sync_playwright() as p:
 
-        # IMPORTANT:
-        # Disable HTTP/2 because VOX was returning
-        # net::ERR_HTTP2_PROTOCOL_ERROR on GitHub Actions.
-        browser = playwright.chromium.launch(
+        browser = p.chromium.launch(
             headless=True,
             args=[
                 "--disable-http2",
+                "--disable-quic",
+                "--disable-features=UseDnsHttpsSvcb",
             ],
         )
 
         context = browser.new_context(
             locale="en-US",
             timezone_id="Africa/Cairo",
+            ignore_https_errors=True,
             user_agent=(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/18.0 Mobile/15E148 Safari/604.1"
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/139.0.0.0 Safari/537.36"
             ),
         )
 
         page = context.new_page()
 
-        page.goto(
-            VOX_URL,
-            wait_until="domcontentloaded",
-            timeout=45000,
-        )
+        # Open VOX
+        try:
 
-        page.wait_for_timeout(2500)
+            get_page(
+                page,
+                VOX_URL,
+            )
+
+        except Exception as e:
+
+            browser.close()
+
+            raise RuntimeError(
+                "VOX main page could not be opened: "
+                f"{type(e).__name__}: {e}"
+            )
 
         date_links = collect_dates(page)
 
@@ -228,56 +251,61 @@ def scan():
             )
 
             if href.startswith("/"):
+
                 full_href = (
-                    "https://egy.voxcinemas.com" + href
+                    "https://egy.voxcinemas.com"
+                    + href
                 )
+
             else:
+
                 full_href = href
 
             date_page = context.new_page()
 
             try:
-                date_page.goto(
-                    full_href,
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
 
-                date_page.wait_for_timeout(1800)
+                try:
 
-                headings = date_page.get_by_text(
-                    "The Odyssey",
-                    exact=True,
-                )
+                    get_page(
+                        date_page,
+                        full_href,
+                    )
 
-                if headings.count() == 0:
+                except Exception:
+
                     continue
 
-                body_text = date_page.locator(
+                body = date_page.locator(
                     "body"
-                ).inner_text()
+                ).inner_text(
+                    timeout=15000
+                )
 
-                if "City Centre Almaza" not in body_text:
+                if "City Centre Almaza" not in body:
                     continue
 
-                imax_locator = date_page.get_by_text(
+                if "The Odyssey" not in body:
+                    continue
+
+                imax = date_page.get_by_text(
                     "IMAX",
                     exact=True,
                 )
 
-                if imax_locator.count() == 0:
+                if imax.count() == 0:
                     continue
 
                 show_links = []
 
-                for index in range(
-                    imax_locator.count()
-                ):
+                for i in range(imax.count()):
 
-                    node = imax_locator.nth(index)
+                    node = imax.nth(i)
 
-                    for _ in range(5):
+                    for _ in range(6):
+
                         try:
+
                             parent = node.locator(
                                 "xpath=.."
                             )
@@ -288,12 +316,15 @@ def scan():
                             node = parent
 
                         except Exception:
+
                             break
 
-                    links = node.locator("a").all()
+                    for link in node.locator(
+                        "a"
+                    ).all():
 
-                    for link in links:
                         try:
+
                             text = link.inner_text().strip()
                             href2 = link.get_attribute(
                                 "href"
@@ -307,14 +338,16 @@ def scan():
                                     re.I,
                                 )
                             ):
+
                                 show_links.append(
                                     (text, href2)
                                 )
 
                         except Exception:
+
                             pass
 
-                # Fallback if the VOX page layout changes.
+                # Fallback
                 if not show_links:
 
                     for link in date_page.locator(
@@ -322,6 +355,7 @@ def scan():
                     ).all():
 
                         try:
+
                             text = link.inner_text().strip()
                             href2 = link.get_attribute(
                                 "href"
@@ -335,24 +369,29 @@ def scan():
                                     re.I,
                                 )
                             ):
+
                                 show_links.append(
                                     (text, href2)
                                 )
 
                         except Exception:
+
                             pass
 
-                seen_show = set()
-                unique_show_links = []
+                unique = []
+                seen = set()
 
                 for item in show_links:
-                    if item not in seen_show:
-                        seen_show.add(item)
-                        unique_show_links.append(item)
 
-                for showtime, show_href in unique_show_links:
+                    if item not in seen:
+
+                        seen.add(item)
+                        unique.append(item)
+
+                for showtime, show_href in unique:
 
                     if show_href.startswith("/"):
+
                         show_href = (
                             "https://egy.voxcinemas.com"
                             + show_href
@@ -361,12 +400,14 @@ def scan():
                     booking_page = context.new_page()
 
                     try:
+
                         status, detail = inspect_booking_page(
                             booking_page,
                             show_href,
                         )
 
                     finally:
+
                         booking_page.close()
 
                     findings.append(
@@ -382,6 +423,7 @@ def scan():
                     )
 
             finally:
+
                 date_page.close()
 
         browser.close()
@@ -396,27 +438,23 @@ def main():
         now, dates_seen, findings = scan()
 
         available = [
-            item
-            for item in findings
-            if item["status"] == "available"
+            x for x in findings
+            if x["status"] == "available"
         ]
 
         login = [
-            item
-            for item in findings
-            if item["status"] == "needs_login"
+            x for x in findings
+            if x["status"] == "needs_login"
         ]
 
         unknown = [
-            item
-            for item in findings
-            if item["status"] == "unknown"
+            x for x in findings
+            if x["status"] == "unknown"
         ]
 
         errors = [
-            item
-            for item in findings
-            if item["status"] == "error"
+            x for x in findings
+            if x["status"] == "error"
         ]
 
         lines = [
@@ -433,9 +471,10 @@ def main():
                 "🚨 TICKETS / SEATS APPEAR AVAILABLE:"
             )
 
-            for item in available:
+            for x in available:
+
                 lines.append(
-                    f"• {item['date']} — {item['time']}"
+                    f"• {x['date']} — {x['time']}"
                 )
 
             notify(
@@ -452,29 +491,34 @@ def main():
             )
 
             if login:
+
                 lines.append(
-                    f"⚠️ {len(login)} showtime(s) "
-                    "require VOX login."
+                    f"⚠️ {len(login)} showtime(s) require VOX login."
                 )
 
             if unknown:
+
                 lines.append(
                     f"⚠️ {len(unknown)} showtime(s) "
                     "could not be confirmed."
                 )
 
             if errors:
+
                 lines.append(
                     f"⚠️ {len(errors)} booking page(s) "
                     "returned an error."
                 )
 
             if dates_seen:
+
                 lines.append(
                     "Dates currently exposed by VOX: "
                     + ", ".join(dates_seen)
                 )
+
             else:
+
                 lines.append(
                     "VOX has not exposed any monitored dates yet."
                 )
@@ -485,13 +529,13 @@ def main():
                 priority=0,
             )
 
-    except Exception as error:
+    except Exception as e:
 
         notify(
             "⚠️ VOX monitor error",
             (
-                f"The hourly check failed: "
-                f"{type(error).__name__}: {error}"
+                "The hourly check failed: "
+                f"{type(e).__name__}: {e}"
             ),
             priority=0,
         )
